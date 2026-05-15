@@ -8,6 +8,7 @@ from discord.ui import Button, View
 import os
 import asyncio
 import random
+import string
 import datetime
 import logging
 
@@ -47,28 +48,70 @@ def get_user_rank(user):
     return (None, "Unranked")
 
 
+# ── Generate a unique league code ────────────────────────────────────────────
+
+def generate_league_code():
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+
+# ── Send log to #logs channel ─────────────────────────────────────────────────
+
+async def send_league_log(guild, lobby, host_member):
+    logs_channel = discord.utils.get(guild.text_channels, name="logs")
+    if not logs_channel:
+        logger.warning("No channel named 'logs' found — skipping log.")
+        return
+
+    # Collect player usernames (exclude host)
+    player_names = []
+    for uid in lobby.joined_users:
+        member = guild.get_member(uid)
+        if member:
+            player_names.append(member.name)
+
+    players_str = ", ".join(player_names) if player_names else "None"
+
+    log_text = (
+        f"League code: {lobby.code}\n"
+        f"Host: {host_member.name} ({host_member.id})\n"
+        f"Game Type: {lobby.mode}\n"
+        f"Perks: {lobby.perks}\n"
+        f"players: {players_str}"
+    )
+
+    # Send as a code block so clicking it selects/copies the whole thing
+    await logs_channel.send(f"```\n{log_text}\n```")
+    logger.info(f"League log sent for code {lobby.code}")
+
+
+# ── LeagueLobby ───────────────────────────────────────────────────────────────
+
 class LeagueLobby:
-    def __init__(self, owner_id, thread, max_players, required_rank):
+    def __init__(self, owner_id, thread, max_players, required_rank, mode, perks):
         self.owner_id = owner_id
-        self.thread = thread          # <-- thread instead of temp_channel
+        self.thread = thread
         self.max_players = max_players
         self.required_rank = required_rank
+        self.mode = mode
+        self.perks = perks
         self.joined_users = []
         self.locked = False
         self.view_message = None
         self.created_at = datetime.datetime.utcnow()
         self.view = None
+        self.code = generate_league_code()   # ← unique code per lobby
 
-    async def auto_close(self):
+    async def auto_close(self, guild, host_member):
         await asyncio.sleep(18000)  # 5 hours
         if self.owner_id in league_lobbies:
             try:
                 logger.info(f"Auto-closing lobby thread for {self.owner_id}")
+                await send_league_log(guild, self, host_member)
                 await self.thread.delete()
             except discord.NotFound:
                 logger.warning("Thread already gone during auto-close")
             except Exception as e:
-                logger.error(f"Error archiving thread during auto-close: {e}")
+                logger.error(f"Error during auto-close: {e}")
             if self.owner_id in league_lobbies:
                 del league_lobbies[self.owner_id]
 
@@ -191,7 +234,6 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
                     )
                     return
 
-            # Add player to thread and lobby
             await lobby.thread.add_user(user)
             lobby.joined_users.append(user.id)
             await lobby.thread.send(f"{user.mention} joined ✅ (Rank: {u_rank_label})")
@@ -206,7 +248,6 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
     leagues_role = discord.utils.get(guild.roles, name="Leagues")
     mention_text = leagues_role.mention if leagues_role else "@Leagues"
 
-    # Send the embed with Join button in the channel
     await interaction.response.send_message(
         content=mention_text,
         embed=embed,
@@ -215,25 +256,27 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
     )
     lobby_message = await interaction.original_response()
 
-    # ── Create a thread from that message ────────────────────────────────────
     thread = await lobby_message.create_thread(
         name=f"⚔️ {creator.name}'s League",
-        auto_archive_duration=1440  # auto-archive after 24 h of inactivity
+        auto_archive_duration=1440
     )
     await thread.add_user(creator)
+
+    # Create lobby — now stores mode & perks too
+    lobby = LeagueLobby(creator.id, thread, players, required_rank, mode, perks)
+    lobby.view_message = lobby_message
+    league_lobbies[creator.id] = lobby
+
     await thread.send(
         f"👋 Welcome, {creator.mention}!\n"
         f"**Host:** {creator.mention} (Rank: {user_rank_label})\n"
         f"**Mode:** {mode} | **Perks:** {perks} | **Rank:** {required_rank}\n"
+        f"**League Code:** `{lobby.code}`\n"
         f"Players joining via the button above will appear here."
     )
 
-    lobby = LeagueLobby(creator.id, thread, players, required_rank)
-    lobby.view_message = lobby_message
-    league_lobbies[creator.id] = lobby
-
-    asyncio.create_task(lobby.auto_close())
-    logger.info(f"League thread created for {creator} — {thread.mention}")
+    asyncio.create_task(lobby.auto_close(guild, creator))
+    logger.info(f"League thread created for {creator} — {thread.mention} — Code: {lobby.code}")
 
 
 # ── /closelobby ───────────────────────────────────────────────────────────────
@@ -244,6 +287,12 @@ async def closelobby(interaction: Interaction):
         await interaction.response.send_message("❌ You don't have an active league lobby.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
+    guild = interaction.guild
+    host = interaction.user
+
+    # Send log before deleting
+    await send_league_log(guild, lobby, host)
+
     try:
         await lobby.thread.delete()
     except Exception as e:
@@ -261,6 +310,12 @@ async def cancelled(interaction: Interaction):
         return
     lobby = league_lobbies[interaction.user.id]
     lobby.locked = True
+    guild = interaction.guild
+    host = interaction.user
+
+    # Send log before deleting
+    await send_league_log(guild, lobby, host)
+
     try:
         await lobby.thread.send("❌ League cancelled by the host.")
         await lobby.thread.delete()
@@ -316,7 +371,6 @@ async def status(interaction: Interaction):
     app_commands.Choice(name="4v4", value=4)
 ])
 async def team(interaction: Interaction, team_size: app_commands.Choice[int]):
-    # Must be used inside the league thread
     for owner_id, lobby in league_lobbies.items():
         if lobby.thread.id == interaction.channel.id:
             players = lobby.joined_users
@@ -382,7 +436,7 @@ async def kickleagueplayer(interaction: Interaction, user: discord.Member):
     return await interaction.response.send_message("✅ User kicked.", ephemeral=True)
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
+# ── /aclhelp ──────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="aclhelp", description="Show all ACL League Bot commands")
 async def help_command(interaction: Interaction):
@@ -399,8 +453,8 @@ async def help_command(interaction: Interaction):
         name="🎮 League Commands",
         value=(
             "`/league` — Host a league (creates a thread automatically)\n"
-            "`/closelobby` — Lock & archive your league thread\n"
-            "`/cancelled` — Cancel the league and lock the thread\n"
+            "`/closelobby` — Close your league thread & log to #logs\n"
+            "`/cancelled` — Cancel the league, lock thread & log to #logs\n"
             "`/leave` — Leave a league lobby\n"
             "`/status` — Show joined players\n"
             "`/team` — Generate random teams *(run inside the thread)*\n"
