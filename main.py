@@ -272,9 +272,11 @@ async def league(
     lobby_message = await interaction.original_response()
 
     # Create thread as PRIVATE so it doesn't show publicly
-    thread = await lobby_message.create_thread(
-        name=f"⚔️ {creator.name}'s League",
-        auto_archive_duration=1440
+    thread = await interaction.channel.create_thread(
+    name=f"⚔️ {creator.name}'s League",
+    type=discord.ChannelType.private_thread,
+    auto_archive_duration=1440,
+    invitable=False   # only host/mods can invite, not members
     )
     await thread.add_user(creator)
 
