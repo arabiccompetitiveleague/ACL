@@ -64,7 +64,7 @@ class LeagueLobby:
         if self.owner_id in league_lobbies:
             try:
                 logger.info(f"Auto-closing lobby thread for {self.owner_id}")
-                await self.thread.edit(archived=True, locked=True)
+                await self.thread.delete()
             except discord.NotFound:
                 logger.warning("Thread already gone during auto-close")
             except Exception as e:
@@ -94,7 +94,7 @@ async def league_cleanup():
             to_remove.append(owner_id)
     for owner_id in to_remove:
         try:
-            await league_lobbies[owner_id].thread.edit(archived=True, locked=True)
+            await league_lobbies[owner_id].thread.delete()
             del league_lobbies[owner_id]
             logger.info(f"Cleaned up expired lobby for {owner_id}")
         except Exception as e:
@@ -245,9 +245,9 @@ async def closelobby(interaction: Interaction):
         return
     lobby = league_lobbies[interaction.user.id]
     try:
-        await lobby.thread.edit(archived=True, locked=True)
+        await lobby.thread.delete()
     except Exception as e:
-        logger.error(f"Error archiving thread: {e}")
+        logger.error(f"Error deleting thread: {e}")
     del league_lobbies[interaction.user.id]
     await interaction.response.send_message("✅ League lobby closed.", ephemeral=True)
 
@@ -263,7 +263,7 @@ async def cancelled(interaction: Interaction):
     lobby.locked = True
     try:
         await lobby.thread.send("❌ League cancelled by the host.")
-        await lobby.thread.edit(archived=True, locked=True)
+        await lobby.thread.delete()
     except Exception as e:
         logger.error(f"Error closing cancelled thread: {e}")
     del league_lobbies[interaction.user.id]
@@ -384,25 +384,33 @@ async def kickleagueplayer(interaction: Interaction, user: discord.Member):
 
 # ── /help ─────────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="help", description="Show all command instructions")
+@bot.tree.command(name="aclhelp", description="Show all ACL League Bot commands")
 async def help_command(interaction: Interaction):
-    msg = """
-📚 **ACL League Bot Help**
-
-📌 **Setup:**
-`/setchannel` — Set channel for league commands and results
-
-🎮 **League Commands:**
-`/league` — Host a league (creates a thread automatically)
-`/closelobby` — Lock & archive your league thread
-`/cancelled` — Cancel the league and lock the thread
-`/leave` — Leave a league lobby
-`/status` — Show joined players
-`/team` — Generate random teams (run inside the thread)
-`/addleagueplayer` — Manually add a player
-`/kickleagueplayer` — Kick a player
-"""
-    await interaction.response.send_message(msg, ephemeral=True)
+    embed = discord.Embed(
+        title="📚 ACL League Bot — Commands",
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="📌 Setup",
+        value="`/setchannel` — Set channel for league commands and results",
+        inline=False
+    )
+    embed.add_field(
+        name="🎮 League Commands",
+        value=(
+            "`/league` — Host a league (creates a thread automatically)\n"
+            "`/closelobby` — Lock & archive your league thread\n"
+            "`/cancelled` — Cancel the league and lock the thread\n"
+            "`/leave` — Leave a league lobby\n"
+            "`/status` — Show joined players\n"
+            "`/team` — Generate random teams *(run inside the thread)*\n"
+            "`/addleagueplayer` — Manually add a player\n"
+            "`/kickleagueplayer` — Kick a player"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="ACL League Bot")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -412,3 +420,4 @@ if not token:
     logger.critical("❌ DISCORD_TOKEN not set!")
     exit()
 bot.run(token)
+ 
