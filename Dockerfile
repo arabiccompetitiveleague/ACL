@@ -1,5 +1,5 @@
 FROM python:3.10-slim
-
+python -m pip install requests==2.6.0
 # Install Tesseract OCR and dependencies
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
