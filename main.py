@@ -12,7 +12,6 @@ import string
 import datetime
 import logging
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -47,14 +46,8 @@ def get_user_rank(user):
                 return (int(code[1:]), label)
     return (None, "Unranked")
 
-
-# ── Generate a unique league code ────────────────────────────────────────────
-
 def generate_league_code():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-
-
-# ── Send log to #logs channel ─────────────────────────────────────────────────
 
 async def send_league_log(guild, lobby, host_member):
     logs_channel = discord.utils.get(guild.text_channels, name="logs")
@@ -62,14 +55,14 @@ async def send_league_log(guild, lobby, host_member):
         logger.warning("No channel named 'logs' found — skipping log.")
         return
 
-    # Collect player usernames (exclude host)
-    player_names = []
+    # Host is always first, then all joined players
+    all_names = [host_member.name]
     for uid in lobby.joined_users:
         member = guild.get_member(uid)
         if member:
-            player_names.append(member.name)
+            all_names.append(member.name)
 
-    players_str = ", ".join(player_names) if player_names else "None"
+    players_str = ", ".join(all_names)
 
     log_text = (
         f"League code: {lobby.code}\n"
@@ -79,34 +72,30 @@ async def send_league_log(guild, lobby, host_member):
         f"players: {players_str}"
     )
 
-    # Send as a code block so clicking it selects/copies the whole thing
     await logs_channel.send(f"```\n{log_text}\n```")
-    logger.info(f"League log sent for code {lobby.code}")
+    logger.info(f"Log sent for league {lobby.code}")
 
-
-# ── LeagueLobby ───────────────────────────────────────────────────────────────
 
 class LeagueLobby:
-    def __init__(self, owner_id, thread, max_players, required_rank, mode, perks):
+    def __init__(self, owner_id, host_member, thread, max_players, required_rank, mode, perks):
         self.owner_id = owner_id
+        self.host_member = host_member      # store the actual Member object
         self.thread = thread
         self.max_players = max_players
         self.required_rank = required_rank
         self.mode = mode
         self.perks = perks
-        self.joined_users = []
+        self.joined_users = []              # only non-host players
         self.locked = False
         self.view_message = None
         self.created_at = datetime.datetime.utcnow()
-        self.view = None
-        self.code = generate_league_code()   # ← unique code per lobby
+        self.code = generate_league_code()
 
-    async def auto_close(self, guild, host_member):
+    async def auto_close(self, guild):
         await asyncio.sleep(18000)  # 5 hours
         if self.owner_id in league_lobbies:
             try:
-                logger.info(f"Auto-closing lobby thread for {self.owner_id}")
-                await send_league_log(guild, self, host_member)
+                await send_league_log(guild, self, self.host_member)
                 await self.thread.delete()
             except discord.NotFound:
                 logger.warning("Thread already gone during auto-close")
@@ -129,7 +118,6 @@ async def on_ready():
 
 @tasks.loop(minutes=30)
 async def league_cleanup():
-    logger.info("Running league cleanup task...")
     current_time = datetime.datetime.utcnow()
     to_remove = []
     for owner_id, lobby in league_lobbies.items():
@@ -139,7 +127,6 @@ async def league_cleanup():
         try:
             await league_lobbies[owner_id].thread.delete()
             del league_lobbies[owner_id]
-            logger.info(f"Cleaned up expired lobby for {owner_id}")
         except Exception as e:
             logger.error(f"Cleanup error for {owner_id}: {e}")
 
@@ -149,7 +136,7 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── /setchannel ──────────────────────────────────────────────────────────────
+# ── /setchannel ───────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="setchannel", description="Set current channel for league commands and results")
 async def setchannel(interaction: Interaction):
@@ -204,7 +191,6 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
     embed.add_field(name="📊 Required Rank", value=required_rank, inline=True)
     embed.set_footer(text="Press Join to enter the league thread!")
 
-    # ── Join button view ──────────────────────────────────────────────────────
     class LeagueJoinView(View):
         def __init__(self):
             super().__init__(timeout=None)
@@ -262,8 +248,8 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
     )
     await thread.add_user(creator)
 
-    # Create lobby — now stores mode & perks too
-    lobby = LeagueLobby(creator.id, thread, players, required_rank, mode, perks)
+    # Pass creator (Member object) into LeagueLobby
+    lobby = LeagueLobby(creator.id, creator, thread, players, required_rank, mode, perks)
     lobby.view_message = lobby_message
     league_lobbies[creator.id] = lobby
 
@@ -275,8 +261,8 @@ async def league(interaction: Interaction, mode: str, players: int, perks: str, 
         f"Players joining via the button above will appear here."
     )
 
-    asyncio.create_task(lobby.auto_close(guild, creator))
-    logger.info(f"League thread created for {creator} — {thread.mention} — Code: {lobby.code}")
+    asyncio.create_task(lobby.auto_close(guild))
+    logger.info(f"League created by {creator} | Code: {lobby.code}")
 
 
 # ── /closelobby ───────────────────────────────────────────────────────────────
@@ -287,11 +273,8 @@ async def closelobby(interaction: Interaction):
         await interaction.response.send_message("❌ You don't have an active league lobby.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
-    guild = interaction.guild
-    host = interaction.user
 
-    # Send log before deleting
-    await send_league_log(guild, lobby, host)
+    await send_league_log(interaction.guild, lobby, lobby.host_member)
 
     try:
         await lobby.thread.delete()
@@ -310,11 +293,8 @@ async def cancelled(interaction: Interaction):
         return
     lobby = league_lobbies[interaction.user.id]
     lobby.locked = True
-    guild = interaction.guild
-    host = interaction.user
 
-    # Send log before deleting
-    await send_league_log(guild, lobby, host)
+    await send_league_log(interaction.guild, lobby, lobby.host_member)
 
     try:
         await lobby.thread.send("❌ League cancelled by the host.")
@@ -373,20 +353,25 @@ async def status(interaction: Interaction):
 async def team(interaction: Interaction, team_size: app_commands.Choice[int]):
     for owner_id, lobby in league_lobbies.items():
         if lobby.thread.id == interaction.channel.id:
-            players = lobby.joined_users
+            # Host is included in the player pool
+            all_players = [lobby.owner_id] + lobby.joined_users
             total_needed = team_size.value * 2
-            if len(players) < total_needed:
+
+            if len(all_players) < total_needed:
                 await interaction.response.send_message(
-                    f"❌ Need {total_needed} players for {team_size.name}, have {len(players)}.",
+                    f"❌ Need {total_needed} players for {team_size.name}, have {len(all_players)}.",
                     ephemeral=True
                 )
                 return
-            shuffled = players[:]
+
+            shuffled = all_players[:]
             random.shuffle(shuffled)
             team_a = shuffled[:team_size.value]
             team_b = shuffled[team_size.value:total_needed]
+
             def mentions(ids):
                 return "\n".join(interaction.guild.get_member(uid).mention for uid in ids)
+
             msg = (
                 f"**Generated {team_size.name} Teams:**\n\n"
                 f"🔴 **Red Team:**\n{mentions(team_a)}\n\n"
