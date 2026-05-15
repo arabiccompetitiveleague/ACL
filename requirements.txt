@@ -1,0 +1,6 @@
+discord.py==2.5.2
+flask
+pytesseract
+Pillow
+aiohttp
+requests
