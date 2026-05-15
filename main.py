@@ -39,6 +39,13 @@ rank_labels = {
     "R10": "R10 - Overlord"
 }
 
+# Auto player count based on mode
+MODE_PLAYER_COUNT = {
+    "2s": 3,
+    "3s": 5,
+    "4s": 7
+}
+
 def get_user_rank(user):
     for role in user.roles:
         for code, label in rank_labels.items():
@@ -67,6 +74,7 @@ async def send_league_log(guild, lobby, host_member):
         f"League code: {lobby.code}\n"
         f"Host: {host_member.name} ({host_member.id})\n"
         f"Game Type: {lobby.mode}\n"
+        f"Game Mode: {lobby.gametype}\n"
         f"Perks: {lobby.perks}\n"
         f"players: {players_str}"
     )
@@ -76,14 +84,16 @@ async def send_league_log(guild, lobby, host_member):
 
 
 class LeagueLobby:
-    def __init__(self, owner_id, host_member, thread, max_players, required_rank, mode, perks):
+    def __init__(self, owner_id, host_member, thread, max_players, required_rank, mode, gametype, perks, link):
         self.owner_id = owner_id
         self.host_member = host_member
         self.thread = thread
         self.max_players = max_players
         self.required_rank = required_rank
-        self.mode = mode
+        self.mode = mode          # 2s / 3s / 4s
+        self.gametype = gametype  # War / Swift
         self.perks = perks
+        self.link = link
         self.joined_users = []
         self.locked = False
         self.view_message = None
@@ -156,10 +166,11 @@ async def setchannel(interaction: Interaction):
 
 @bot.tree.command(name="league", description="Create a league lobby")
 @app_commands.describe(
-    mode="Game mode",
-    players="Number of players needed (not counting host)",
+    mode="2s, 3s, or 4s (auto-sets player count)",
+    gametype="War or Swift",
     perks="Perks on or off",
-    rank="Required Rank (Any or R3–R10)"
+    rank="Required Rank (Any or R3–R10)",
+    link="Game link (will appear as a clickable link in the thread)"
 )
 @app_commands.choices(
     mode=[
@@ -167,13 +178,9 @@ async def setchannel(interaction: Interaction):
         app_commands.Choice(name="3s", value="3s"),
         app_commands.Choice(name="4s", value="4s"),
     ],
-    players=[
-        app_commands.Choice(name="2", value=2),
-        app_commands.Choice(name="3", value=3),
-        app_commands.Choice(name="4", value=4),
-        app_commands.Choice(name="5", value=5),
-        app_commands.Choice(name="6", value=6),
-        app_commands.Choice(name="7", value=7),
+    gametype=[
+        app_commands.Choice(name="War", value="War"),
+        app_commands.Choice(name="Swift", value="Swift"),
     ],
     perks=[
         app_commands.Choice(name="On", value="on"),
@@ -187,9 +194,10 @@ async def setchannel(interaction: Interaction):
 async def league(
     interaction: Interaction,
     mode: app_commands.Choice[str],
-    players: app_commands.Choice[int],
+    gametype: app_commands.Choice[str],
     perks: app_commands.Choice[str],
-    rank: app_commands.Choice[str]
+    rank: app_commands.Choice[str],
+    link: str
 ):
     if ALLOWED_CHANNEL_ID and interaction.channel.id != ALLOWED_CHANNEL_ID:
         await interaction.response.send_message("❌ Use commands in the set channel only.", ephemeral=True)
@@ -204,16 +212,21 @@ async def league(
     user_rank, user_rank_label = get_user_rank(creator)
     guild = interaction.guild
 
-    embed = discord.Embed(
+    # Auto player count
+    max_players = MODE_PLAYER_COUNT[mode.value]
+
+    # ── Embed for the league channel (no league code, has Join button) ──
+    channel_embed = discord.Embed(
         title="🏆 ACL LEAGUE",
         description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
         color=discord.Color.blue()
     )
-    embed.add_field(name="🎮 Mode", value=mode.value, inline=True)
-    embed.add_field(name="👥 Players Needed", value=str(players.value), inline=True)
-    embed.add_field(name="⚙️ Perks", value=perks.value, inline=True)
-    embed.add_field(name="📊 Required Rank", value=required_rank, inline=True)
-    embed.set_footer(text="Press Join to enter the league thread!")
+    channel_embed.add_field(name="🎮 Mode", value=mode.value, inline=True)
+    channel_embed.add_field(name="⚔️ Game Type", value=gametype.value, inline=True)
+    channel_embed.add_field(name="👥 Players Needed", value=str(max_players), inline=True)
+    channel_embed.add_field(name="⚙️ Perks", value=perks.value, inline=True)
+    channel_embed.add_field(name="📊 Required Rank", value=required_rank, inline=True)
+    channel_embed.set_footer(text="Press Join to enter the league thread!")
 
     class LeagueJoinView(View):
         def __init__(self):
@@ -248,7 +261,6 @@ async def league(
             lobby.joined_users.append(user.id)
             await lobby.thread.send(f"{user.mention} joined ✅ (Rank: {u_rank_label})")
 
-            # Send the thread link ONLY to the joining player (ephemeral)
             await join_interaction.response.send_message(
                 f"✅ You're in! Join the thread here: {lobby.thread.mention}",
                 ephemeral=True
@@ -265,34 +277,49 @@ async def league(
 
     await interaction.response.send_message(
         content=mention_text,
-        embed=embed,
+        embed=channel_embed,
         view=view,
         allowed_mentions=discord.AllowedMentions(roles=True)
     )
     lobby_message = await interaction.original_response()
 
-    # Create thread as PRIVATE so it doesn't show publicly
+    # Private thread
     thread = await interaction.channel.create_thread(
-    name=f"⚔️ {creator.name}'s League",
-    type=discord.ChannelType.private_thread,
-    auto_archive_duration=1440,
-    invitable=False   # only host/mods can invite, not members
+        name=f"⚔️ {creator.name}'s League",
+        type=discord.ChannelType.private_thread,
+        auto_archive_duration=1440,
+        invitable=False
     )
     await thread.add_user(creator)
 
-    lobby = LeagueLobby(creator.id, creator, thread, players.value, required_rank, mode.value, perks.value)
+    lobby = LeagueLobby(
+        creator.id, creator, thread, max_players,
+        required_rank, mode.value, gametype.value, perks.value, link
+    )
     lobby.view_message = lobby_message
     league_lobbies[creator.id] = lobby
 
+    # ── Embed for the thread (same as channel embed but no Join button) ──
+    thread_embed = discord.Embed(
+        title="🏆 ACL LEAGUE",
+        description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
+        color=discord.Color.blue()
+    )
+    thread_embed.add_field(name="🎮 Mode", value=mode.value, inline=True)
+    thread_embed.add_field(name="⚔️ Game Type", value=gametype.value, inline=True)
+    thread_embed.add_field(name="👥 Players Needed", value=str(max_players), inline=True)
+    thread_embed.add_field(name="⚙️ Perks", value=perks.value, inline=True)
+    thread_embed.add_field(name="📊 Required Rank", value=required_rank, inline=True)
+    thread_embed.add_field(name="🔑 League Code", value=f"`{lobby.code}`", inline=False)
+    thread_embed.set_footer(text="ACL League")
+
+    # Send game link on top, then embed (no Join button)
     await thread.send(
-        f"👋 Welcome, {creator.mention}!\n"
-        f"**Host:** {creator.mention} (Rank: {user_rank_label})\n"
-        f"**Mode:** {mode.value} | **Perks:** {perks.value} | **Rank:** {required_rank}\n"
-        f"**League Code:** `{lobby.code}`\n"
-        f"Players joining via the button above will appear here."
+        content=f"🔗 **Game Link:** [Click here to join the game]({link})",
+        embed=thread_embed
     )
 
-    # Send thread link privately to host only
+    # Private link to host only
     await interaction.followup.send(
         f"✅ Your league thread: {thread.mention}",
         ephemeral=True
@@ -473,7 +500,7 @@ async def help_command(interaction: Interaction):
     embed.add_field(
         name="🎮 League Commands",
         value=(
-            "`/league` — Host a league (creates a thread automatically)\n"
+            "`/league` — Host a league (creates a private thread automatically)\n"
             "`/closelobby` — Close your league thread & log to #logs\n"
             "`/cancelled` — Cancel the league, lock thread & log to #logs\n"
             "`/leave` — Leave a league lobby\n"
@@ -494,4 +521,4 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     logger.critical("❌ DISCORD_TOKEN not set!")
     exit()
-bot.run(token) 
+bot.run(token)
