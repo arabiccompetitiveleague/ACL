@@ -11,6 +11,10 @@ import random
 import string
 import datetime
 import logging
+import re
+import io
+from PIL import Image
+import pytesseract
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +43,7 @@ rank_labels = {
     "R10": "R10 - Overlord"
 }
 
-# Auto player count based on mode
+# Auto player count based on mode selection
 MODE_PLAYER_COUNT = {
     "2s": 3,
     "3s": 5,
@@ -59,7 +63,7 @@ def generate_league_code():
 async def send_league_log(guild, lobby, host_member):
     logs_channel = discord.utils.get(guild.text_channels, name="logs")
     if not logs_channel:
-        logger.warning("No channel named 'logs' found — skipping log.")
+        logger.warning("No channel named 'logs' found — skipping log archive.")
         return
 
     all_names = [host_member.name]
@@ -80,7 +84,7 @@ async def send_league_log(guild, lobby, host_member):
     )
 
     await logs_channel.send(f"```\n{log_text}\n```")
-    logger.info(f"Log sent for league {lobby.code}")
+    logger.info(f"Log sent successfully for league code {lobby.code}")
 
 
 class LeagueLobby:
@@ -101,15 +105,15 @@ class LeagueLobby:
         self.code = generate_league_code()
 
     async def auto_close(self, guild):
-        await asyncio.sleep(18000)  # 5 hours
+        await asyncio.sleep(18000)  # 5 hours auto archive timer
         if self.owner_id in league_lobbies:
             try:
                 await send_league_log(guild, self, self.host_member)
                 await self.thread.delete()
             except discord.NotFound:
-                logger.warning("Thread already gone during auto-close")
+                logger.warning("Thread already gone during auto-close context")
             except Exception as e:
-                logger.error(f"Error during auto-close: {e}")
+                logger.error(f"Error during auto-close execution: {e}")
             if self.owner_id in league_lobbies:
                 del league_lobbies[self.owner_id]
 
@@ -119,9 +123,9 @@ async def on_ready():
     logger.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     try:
         await bot.tree.sync()
-        logger.info("✅ Slash commands synced")
+        logger.info("✅ Application Slash Commands completely synchronized.")
     except Exception as e:
-        logger.error(f"Command sync error: {e}")
+        logger.error(f"Global command sync failure context: {e}")
     league_cleanup.start()
 
 
@@ -137,12 +141,100 @@ async def league_cleanup():
             await league_lobbies[owner_id].thread.delete()
             del league_lobbies[owner_id]
         except Exception as e:
-            logger.error(f"Cleanup error for {owner_id}: {e}")
+            logger.error(f"Cleanup processing error for owner ID {owner_id}: {e}")
 
 
 @league_cleanup.before_loop
 async def before_league_cleanup():
     await bot.wait_until_ready()
+
+
+# ── نظام استماع وقراءة الصور وحساب الصدارة التلقائي نتائج-الليز ──────────────────
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    # التفعيل الاحترافي التلقائي داخل قناة نتائج-الليز أو القناة المحددة يدويًا بالايدي
+    is_valid_channel = False
+    if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
+        is_valid_channel = True
+    elif hasattr(message.channel, 'name') and message.channel.name == "نتائج-الليز":
+        is_valid_channel = True
+
+    if is_valid_channel:
+        if message.attachments:
+            for attachment in message.attachments:
+                if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp']):
+                    
+                    processing_msg = await message.reply("جاري معالجة صورة النتيجة وقراءة قائمة الصدارة... 🔄")
+                    
+                    try:
+                        image_bytes = await attachment.read()
+                        image = Image.open(io.BytesIO(image_bytes))
+                        
+                        # استخراج السجلات النصية من الخادم عبر محرك OCR
+                        extracted_text = pytesseract.image_to_string(image)
+                        logger.info(f"OCR Extracted Output Text Context:\n{extracted_text}")
+                        
+                        players_stats = []
+                        lines = extracted_text.split('\n')
+                        
+                        for line in lines:
+                            line = line.strip()
+                            # تتبع الأرقام مقسومة بـ / أو | للتخلص من قيود اللغات المختلفة داخل واجهة اللعبة
+                            score_match = re.search(r'(\d+)\s*[\/\|]\s*(\d+)', line)
+                            if score_match:
+                                kills = int(score_match.group(1))
+                                deaths = int(score_match.group(2))
+                                
+                                # حساب الـ KDR وتجنب خطأ الحساب عند الصفر لعدم توقف البوت
+                                kdr = float(kills) if deaths == 0 else round(kills / deaths, 2)
+                                
+                                name_part = line.split(score_match.group(0))[0].strip()
+                                player_name = re.sub(r'[^a-zA-Z0-9_\-\s]', '', name_part).strip()
+                                
+                                if not player_name or len(player_name) < 2:
+                                    player_name = f"Player_K:{kills}"
+                                
+                                players_stats.append({
+                                    'name': player_name,
+                                    'kills': kills,
+                                    'deaths': deaths,
+                                    'kdr': kdr
+                                })
+                        
+                        if players_stats:
+                            # الترتيب الاحترافي التنازلي: الأكثر قتلاً ثم الأقل موتاً (أعلى KDR)
+                            players_stats.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
+                            
+                            embed = discord.Embed(
+                                title="🏆 ملخص نتائج المباراة والصدارة", 
+                                color=discord.Color.gold()
+                            )
+                            embed.set_author(name=message.author.display_name, icon_url=message.author.avatar.url if message.author.avatar else None)
+                            
+                            leaderboard_text = ""
+                            medals = ["🥇", "🥈", "🥉", "🏅", "🏅", "🏅", "🏅", "🏅"]
+                            
+                            for index, p in enumerate(players_stats):
+                                medal = medals[index] if index < len(medals) else "🏅"
+                                leaderboard_text += f"{medal} **#{index+1} {p['name']}**\n"
+                                leaderboard_text += f"┗ ⚔️ Kills: `{p['kills']}` | 💀 Deaths: `{p['deaths']}` | 📈 KDR: `**{p['kdr']}**`\n\n"
+                            
+                            embed.description = leaderboard_text
+                            embed.set_footer(text="Murderers VS Sheriffs Duels Leaderboard")
+                            
+                            await processing_msg.edit(content=None, embed=embed)
+                        else:
+                            await processing_msg.edit(content="❌ لم أتمكن من العثور على أرقام النتائج بشكل واضح (تأكد من أن جودة الصورة ممتازة والجدول غير مقصوص).")
+                            
+                    except Exception as e:
+                        logger.error(f"Error parsing leaderboard OCR engine details: {e}")
+                        await processing_msg.edit(content="⚠️ حدث خطأ أثناء قراءة وتحليل بيانات الصورة.")
+
+    await bot.process_commands(message)
 
 
 # ── /setchannel ───────────────────────────────────────────────────────────────
@@ -200,8 +292,9 @@ async def league(
     link: str
 ):
     if ALLOWED_CHANNEL_ID and interaction.channel.id != ALLOWED_CHANNEL_ID:
-        await interaction.response.send_message("❌ Use commands in the set channel only.", ephemeral=True)
-        return
+        if interaction.channel.name != "نتائج-الليز":
+            await interaction.response.send_message("❌ Use commands in the set channel only.", ephemeral=True)
+            return
 
     creator = interaction.user
     if creator.id in league_lobbies:
@@ -212,10 +305,8 @@ async def league(
     user_rank, user_rank_label = get_user_rank(creator)
     guild = interaction.guild
 
-    # Auto player count
     max_players = MODE_PLAYER_COUNT[mode.value]
 
-    # ── Embed for the league channel (no league code, has Join button) ──
     channel_embed = discord.Embed(
         title="🏆 ACL LEAGUE",
         description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
@@ -283,7 +374,6 @@ async def league(
     )
     lobby_message = await interaction.original_response()
 
-    # Private thread
     thread = await interaction.channel.create_thread(
         name=f"⚔️ {creator.name}'s League",
         type=discord.ChannelType.private_thread,
@@ -299,7 +389,6 @@ async def league(
     lobby.view_message = lobby_message
     league_lobbies[creator.id] = lobby
 
-    # ── Embed for the thread (same as channel embed but no Join button) ──
     thread_embed = discord.Embed(
         title="🏆 ACL LEAGUE",
         description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
@@ -313,13 +402,11 @@ async def league(
     thread_embed.add_field(name="🔑 League Code", value=f"`{lobby.code}`", inline=False)
     thread_embed.set_footer(text="ACL League")
 
-    # Send game link on top, then embed (no Join button)
     await thread.send(
         content=f"🔗 **Game Link:** [Click here to join the game]({link})",
         embed=thread_embed
     )
 
-    # Private link to host only
     await interaction.followup.send(
         f"✅ Your league thread: {thread.mention}",
         ephemeral=True
@@ -343,7 +430,7 @@ async def closelobby(interaction: Interaction):
     try:
         await lobby.thread.delete()
     except Exception as e:
-        logger.error(f"Error deleting thread: {e}")
+        logger.error(f"Error deleting thread structure: {e}")
     del league_lobbies[interaction.user.id]
     await interaction.response.send_message("✅ League lobby closed.", ephemeral=True)
 
@@ -364,7 +451,7 @@ async def cancelled(interaction: Interaction):
         await lobby.thread.send("❌ League cancelled by the host.")
         await lobby.thread.delete()
     except Exception as e:
-        logger.error(f"Error closing cancelled thread: {e}")
+        logger.error(f"Error closing cancelled thread framework: {e}")
     del league_lobbies[interaction.user.id]
     await interaction.response.send_message("League cancelled and thread locked.", ephemeral=True)
 
@@ -515,10 +602,10 @@ async def help_command(interaction: Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+# ── Run Context ───────────────────────────────────────────────────────────────
 
 token = os.getenv("DISCORD_TOKEN")
 if not token:
-    logger.critical("❌ DISCORD_TOKEN not set!")
+    logger.critical("❌ DISCORD_TOKEN environment variable not set inside system context!")
     exit()
 bot.run(token)
