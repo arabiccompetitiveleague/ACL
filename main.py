@@ -31,7 +31,6 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 league_lobbies = {}
 
-# Dual-channel storage setup
 LEAGUE_CHANNEL_ID = None
 RESULTS_CHANNEL_ID = None
 
@@ -152,130 +151,124 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── PERFECT COMPACT MATCH RESULTS SYSTEM WITH CORRECT OCR NAMES ──
+# ── ADVANCED DYNAMIC MULTI-IMAGE RESULTS TRACKER ──
 @bot.event
 async def on_message(message):
     if message.author == bot.user or not message.guild:
         return
 
-    # Images are only read inside the specified results channel ID
     if RESULTS_CHANNEL_ID and message.channel.id == RESULTS_CHANNEL_ID:
         if message.attachments:
-            round_count = len(message.attachments)
-            attachment = message.attachments[0]
+            # Filters only valid image attachments uploaded
+            valid_attachments = [
+                a for a in message.attachments 
+                if any(a.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp'])
+            ]
             
-            if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp']):
-                processing_msg = await message.reply("Analyzing match statistics... 🔄")
+            if not valid_attachments:
+                return
                 
-                try:
+            round_count = len(valid_attachments)
+            processing_msg = await message.reply(f"Processing scoreboard data from {round_count} image(s)... 🔄")
+            
+            # Dictionary to dynamically hold and accumulate data: { username: {"kills": X, "deaths": Y, "team_type": "green/red"} }
+            master_stats = {}
+            
+            try:
+                for attachment in valid_attachments:
                     image_bytes = await attachment.read()
                     orig_image = Image.open(io.BytesIO(image_bytes))
                     
-                    # Enhanced image processing to isolate names clearly away from numbers
+                    # Target image optimization matrix
                     gray_img = orig_image.convert('L')
                     gray_img = ImageOps.autocontrast(gray_img)
                     w, h = gray_img.size
                     resized_img = gray_img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
                     
                     extracted_text = pytesseract.image_to_string(resized_img, config='--psm 6')
-                    logger.info(f"OCR Output Log:\n{extracted_text}")
-                    
                     lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
                     
-                    # Absolute fallback values array matching target image order exactly
-                    fallback_players = [
-                        {'name': 'Future', 'kills': 8, 'deaths': 3},
-                        {'name': 'hakseong1217', 'kills': 6, 'deaths': 2},
-                        {'name': 'Divine', 'kills': 4, 'deaths': 5},
-                        {'name': 'LIFEV', 'kills': 2, 'deaths': 3},
-                        {'name': 'apex', 'kills': 2, 'deaths': 5},
-                        {'name': 'VesBakery', 'kills': 2, 'deaths': 6}
-                    ]
-                    
-                    parsed_players = []
-                    row_index = 0
-                    
+                    row_idx = 0
                     for line in lines:
-                        # Find the score structure (Kills / Deaths)
+                        # Find the score structure matching 'Kills / Deaths' formats
                         score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', line)
                         if score_match:
                             try:
                                 kills = int(score_match.group(1))
                                 deaths = int(score_match.group(2))
                                 
-                                # Isolate name part before the score split
+                                # Clean user nickname segment cleanly
                                 name_part = line.split(score_match.group(0))[0].strip()
-                                # Clear noise but keep clean alphabet characters and standard underscores
                                 player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', name_part).strip()
                                 
-                                # Prevent system text fields from leaking into player names
+                                # Strips out generic interface label artifacts
                                 if player_name.lower() in ['kills', 'deaths', 'kdr', 'score', 'device', 'all', 'omall', 'aall', 'oomall', '']:
-                                    if row_index < len(fallback_players):
-                                        player_name = fallback_players[row_index]['name']
-                                    else:
-                                        player_name = f"Player_{row_index+1}"
+                                    # Safe structural placement identifier if text was unreadable
+                                    player_name = f"Unresolved_Row_{row_idx + 1}"
                                 
-                                parsed_players.append({'name': player_name, 'kills': kills, 'deaths': deaths})
-                                row_index += 1
+                                # Determine native layout color team placement based on target design line rows (0, 1, 3 are Green)
+                                current_team = "green" if row_idx in [0, 1, 3] else "red"
+                                
+                                # Sum numbers cleanly into master storage if player exists, or initiate new entry
+                                if player_name in master_stats:
+                                    master_stats[player_name]["kills"] += kills
+                                    master_stats[player_name]["deaths"] += deaths
+                                else:
+                                    master_stats[player_name] = {
+                                        "kills": kills,
+                                        "deaths": deaths,
+                                        "team_type": current_team
+                                    }
+                                
+                                row_idx += 1
                             except Exception:
                                 continue
 
-                    # If OCR misses lines or values completely, auto-fill using fixed profile matching
-                    if len(parsed_players) < 6:
-                        parsed_players = []
-                        for idx, fp in enumerate(fallback_players):
-                            # Try searching for corresponding custom read variables inside line strings
-                            found_line = None
-                            for line in lines:
-                                if fp['name'].lower() in line.lower():
-                                    found_line = line
-                                    break
-                            
-                            if found_line:
-                                sm = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', found_line)
-                                if sm:
-                                    parsed_players.append({
-                                        'name': fp['name'],
-                                        'kills': int(sm.group(1)),
-                                        'deaths': int(sm.group(2))
-                                    })
-                                    continue
-                            parsed_players.append(fp)
-
-                    # Distribute total metrics across multi-image rounds correctly
-                    for p in parsed_players:
-                        if round_count > 1:
-                            p['kills'] = p['kills'] * round_count
-                            p['deaths'] = max(1, p['deaths'] * round_count)
-                        p['kdr'] = round(p['kills'] / p['deaths'], 2) if p['deaths'] > 0 else float(p['kills'])
-
-                    # Assign team splits based on game design row indexes (Rows 0, 1, 3 for Green Team)
+                if master_stats:
                     green_team = []
                     red_team = []
                     
-                    for i, p in enumerate(parsed_players):
-                        if i in [0, 1, 3]:
-                            green_team.append(p)
+                    # Final calculations across compiled dynamic dataset
+                    for p_name, data in master_stats.items():
+                        k = data["kills"]
+                        d = max(1, data["deaths"]) # Cap deaths floor at 1 to prevent division by zero errors
+                        kdr = round(k / d, 2)
+                        
+                        player_payload = {
+                            "name": p_name,
+                            "kills": k,
+                            "deaths": data["deaths"],
+                            "kdr": kdr
+                        }
+                        
+                        if data["team_type"] == "green":
+                            green_team.append(player_payload)
                         else:
-                            red_team.append(p)
+                            red_team.append(player_payload)
 
-                    # Performance sort configurations
+                    # Dynamic sorting based strictly on compiled game achievements
                     red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     
-                    # Build exact slim embed format string
+                    # Format output string tightly
                     embed_desc = f"**Match Results (from {round_count} rounds)**\n\n"
                     
                     embed_desc += "**Red Team:**\n"
-                    for idx, p in enumerate(red_team):
-                        medal = " 🥈" if idx == 0 and len(red_team) > 0 else ""
-                        embed_desc += f"{p['name']}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                    if red_team:
+                        for idx, p in enumerate(red_team):
+                            medal = " 🥈" if idx == 0 else ""
+                            embed_desc += f"{p['name']}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                    else:
+                        embed_desc += "*No players parsed*\n"
                         
                     embed_desc += "\n**Green Team:**\n"
-                    for idx, p in enumerate(green_team):
-                        medal = " 👑" if idx == 0 else ""
-                        name_style = f"**{p['name']}**" if idx == 0 else p['name']
-                        embed_desc += f"{name_style}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                    if green_team:
+                        for idx, p in enumerate(green_team):
+                            medal = " 👑" if idx == 0 else ""
+                            name_style = f"**{p['name']}**" if idx == 0 else p['name']
+                            embed_desc += f"{name_style}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                    else:
+                        embed_desc += "*No players parsed*\n"
 
                     embed_desc += "\nUse clear, uncropped screenshots with nothing blocking the scoreboard for best results. Check results for inaccuracies if needed. Running the command again can fix some mistakes."
 
@@ -285,16 +278,17 @@ async def on_message(message):
                     )
                     
                     await processing_msg.edit(content=None, embed=embed)
-                except Exception as e:
-                    logger.error(f"OCR error: {e}")
-                    await processing_msg.edit(content="⚠️ An error occurred while parsing image.")
-                return
+                else:
+                    await processing_msg.edit(content="❌ Could not isolate standard score values from image fields. Please ensure scoreboard is clear.")
+            except Exception as e:
+                logger.error(f"OCR loop error: {e}")
+                await processing_msg.edit(content="⚠️ An error occurred while parsing your scoreboard image uploads.")
+            return
 
     await bot.process_commands(message)
 
 
-# ── /setchannel UPDATED WITH league AND results OPTIONS ─────────────────────────
-
+# ── /setchannel COMMAND ──
 @bot.tree.command(name="setchannel", description="Set target channel for league commands or match results output")
 @app_commands.describe(type="Choose whether this channel is for hosting leagues or displaying match results")
 @app_commands.choices(type=[
@@ -318,8 +312,7 @@ async def setchannel(interaction: Interaction, type: app_commands.Choice[str]):
         )
 
 
-# ── /league (RESTRICTED TO LEAGUE CHANNEL) ──────────────────────────────────────
-
+# ── /league COMMAND ──
 @bot.tree.command(name="league", description="Create a league lobby")
 @app_commands.describe(
     mode="2s, 3s, or 4s (auto-sets player count)",
@@ -476,11 +469,9 @@ async def league(
     )
 
     asyncio.create_task(lobby.auto_close(guild))
-    logger.info(f"League created by {creator} | Code: {lobby.code}")
 
 
-# ── OTHER BOT COMMANDS ────────────────────────────────────────────────────────
-
+# ── MANAGEMENT COMMANDS ──
 @bot.tree.command(name="closelobby", description="Close your league lobby thread")
 async def closelobby(interaction: Interaction):
     if interaction.user.id not in league_lobbies:
@@ -652,4 +643,3 @@ if not token:
     logger.critical("❌ DISCORD_TOKEN not set!")
     exit()
 bot.run(token)
- 
