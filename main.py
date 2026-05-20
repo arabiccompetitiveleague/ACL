@@ -151,7 +151,7 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── ADVANCED DYNAMIC MULTI-IMAGE RESULTS TRACKER ──
+# ── ULTRA PRECISE OCR PARSER (NO FORGOTTEN PLAYERS, NO BAD NAMES) ──
 @bot.event
 async def on_message(message):
     if message.author == bot.user or not message.guild:
@@ -159,7 +159,6 @@ async def on_message(message):
 
     if RESULTS_CHANNEL_ID and message.channel.id == RESULTS_CHANNEL_ID:
         if message.attachments:
-            # Filters only valid image attachments uploaded
             valid_attachments = [
                 a for a in message.attachments 
                 if any(a.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp'])
@@ -169,9 +168,8 @@ async def on_message(message):
                 return
                 
             round_count = len(valid_attachments)
-            processing_msg = await message.reply(f"Processing scoreboard data from {round_count} image(s)... 🔄")
+            processing_msg = await message.reply(f"Processing leaderboard stats from {round_count} match screenshot(s)... 🔄")
             
-            # Dictionary to dynamically hold and accumulate data: { username: {"kills": X, "deaths": Y, "team_type": "green/red"} }
             master_stats = {}
             
             try:
@@ -179,7 +177,7 @@ async def on_message(message):
                     image_bytes = await attachment.read()
                     orig_image = Image.open(io.BytesIO(image_bytes))
                     
-                    # Target image optimization matrix
+                    # Maximum thresholding optimization to sharpen text boundaries
                     gray_img = orig_image.convert('L')
                     gray_img = ImageOps.autocontrast(gray_img)
                     w, h = gray_img.size
@@ -190,26 +188,29 @@ async def on_message(message):
                     
                     row_idx = 0
                     for line in lines:
-                        # Find the score structure matching 'Kills / Deaths' formats
+                        # Locate Kills / Deaths patterns safely via flexible delimiter checking
                         score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', line)
                         if score_match:
                             try:
                                 kills = int(score_match.group(1))
                                 deaths = int(score_match.group(2))
                                 
-                                # Clean user nickname segment cleanly
-                                name_part = line.split(score_match.group(0))[0].strip()
-                                player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', name_part).strip()
+                                # Cut out everything happening after the score group starts
+                                raw_name_part = line.split(score_match.group(0))[0].strip()
                                 
-                                # Strips out generic interface label artifacts
-                                if player_name.lower() in ['kills', 'deaths', 'kdr', 'score', 'device', 'all', 'omall', 'aall', 'oomall', '']:
-                                    # Safe structural placement identifier if text was unreadable
-                                    player_name = f"Unresolved_Row_{row_idx + 1}"
+                                # Heavy filter targeting UI artifact leaking phrases
+                                clean_name = re.sub(r'(?i)\b(device|ping|all|omall|mmall|ammall|oomall|aall|leall|lelall|ooisal|kills|deaths|kdr|score|name)\b', '', raw_name_part)
                                 
-                                # Determine native layout color team placement based on target design line rows (0, 1, 3 are Green)
-                                current_team = "green" if row_idx in [0, 1, 3] else "red"
+                                # Strip out leftover noise characters but retain normal gamertag syntax characters
+                                player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', clean_name).strip()
                                 
-                                # Sum numbers cleanly into master storage if player exists, or initiate new entry
+                                # Fallback names structure so rows are NEVER skipped or dropped completely
+                                if not player_name or len(player_name) < 2:
+                                    player_name = f"Player_Slot_{row_idx + 1}"
+                                
+                                # Match team row allocations based on client viewport mapping (0, 1, 4 are Green)
+                                current_team = "green" if row_idx in [0, 1, 4] else "red"
+                                
                                 if player_name in master_stats:
                                     master_stats[player_name]["kills"] += kills
                                     master_stats[player_name]["deaths"] += deaths
@@ -228,10 +229,9 @@ async def on_message(message):
                     green_team = []
                     red_team = []
                     
-                    # Final calculations across compiled dynamic dataset
                     for p_name, data in master_stats.items():
                         k = data["kills"]
-                        d = max(1, data["deaths"]) # Cap deaths floor at 1 to prevent division by zero errors
+                        d = max(1, data["deaths"])
                         kdr = round(k / d, 2)
                         
                         player_payload = {
@@ -246,11 +246,10 @@ async def on_message(message):
                         else:
                             red_team.append(player_payload)
 
-                    # Dynamic sorting based strictly on compiled game achievements
+                    # Balanced placement rendering sorting matrices
                     red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     
-                    # Format output string tightly
                     embed_desc = f"**Match Results (from {round_count} rounds)**\n\n"
                     
                     embed_desc += "**Red Team:**\n"
@@ -259,7 +258,7 @@ async def on_message(message):
                             medal = " 🥈" if idx == 0 else ""
                             embed_desc += f"{p['name']}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
                     else:
-                        embed_desc += "*No players parsed*\n"
+                        embed_desc += "*No rows identified*\n"
                         
                     embed_desc += "\n**Green Team:**\n"
                     if green_team:
@@ -268,7 +267,7 @@ async def on_message(message):
                             name_style = f"**{p['name']}**" if idx == 0 else p['name']
                             embed_desc += f"{name_style}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
                     else:
-                        embed_desc += "*No players parsed*\n"
+                        embed_desc += "*No rows identified*\n"
 
                     embed_desc += "\nUse clear, uncropped screenshots with nothing blocking the scoreboard for best results. Check results for inaccuracies if needed. Running the command again can fix some mistakes."
 
@@ -279,10 +278,10 @@ async def on_message(message):
                     
                     await processing_msg.edit(content=None, embed=embed)
                 else:
-                    await processing_msg.edit(content="❌ Could not isolate standard score values from image fields. Please ensure scoreboard is clear.")
+                    await processing_msg.edit(content="❌ Unable to extract readable score layouts. Check your source clip cropped area.")
             except Exception as e:
-                logger.error(f"OCR loop error: {e}")
-                await processing_msg.edit(content="⚠️ An error occurred while parsing your scoreboard image uploads.")
+                logger.error(f"OCR execution failure: {e}")
+                await processing_msg.edit(content="⚠️ An unexpected internal parser exception occurred.")
             return
 
     await bot.process_commands(message)
