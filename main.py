@@ -150,16 +150,16 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── AUTOMATED MATCH RESULTS & KDR SCANNER SYSTEM ──
+# ── CLEANED AUTOMATED MATCH RESULTS EMBED SYSTEM ──
 @bot.event
 async def on_message(message):
     if message.author == bot.user or not message.guild:
         return
 
-    # Restrict OCR scanning exclusively to the configured channel
+    # Check if image processing should run inside the allowed channel setup
     if ALLOWED_CHANNEL_ID and message.channel.id == ALLOWED_CHANNEL_ID:
         if message.attachments:
-            # Dynamically check total attachments sent to update the round calculation
+            # Count the total number of screenshot attachments sent at once
             round_count = len(message.attachments)
             attachment = message.attachments[0]
             
@@ -170,7 +170,7 @@ async def on_message(message):
                     image_bytes = await attachment.read()
                     orig_image = Image.open(io.BytesIO(image_bytes))
                     
-                    # Image optimizations for better text parsing
+                    # Pre-processing configurations to clear up background contrast
                     gray_img = orig_image.convert('L')
                     gray_img = ImageOps.autocontrast(gray_img)
                     w, h = gray_img.size
@@ -183,7 +183,7 @@ async def on_message(message):
                     green_team = []
                     lines = extracted_text.split('\n')
                     
-                    # Consistent UI baseline list to back up custom text tracking variants
+                    # Baseline name dictionary matching row index placements
                     fallback_names = ["Future", "hakseong1217", "Divine", "LIFEV", "apex", "VesBakery"]
                     
                     row_index = 0
@@ -196,14 +196,14 @@ async def on_message(message):
                                 kills = int(score_match.group(1))
                                 deaths = int(score_match.group(2))
                                 
-                                # Scale performance stats up relative to total rounds provided
+                                # Process scaling factor for multi-image match sets
                                 if round_count > 1:
                                     kills = kills * round_count
                                     deaths = max(1, deaths * round_count)
                                     
                                 kdr = round(kills / deaths, 2) if deaths > 0 else float(kills)
                                 
-                                # Clean up formatting clutter words and glitch text variables
+                                # Isolate and sanitize names away from background scan text artifacts
                                 name_part = line.split(score_match.group(0))[0].strip()
                                 player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', name_part).strip()
                                 
@@ -215,28 +215,29 @@ async def on_message(message):
                                 
                                 player_data = {'name': player_name, 'kills': kills, 'deaths': deaths, 'kdr': kdr}
                                 
-                                # Split positions down precisely matching layout coordinates
-                                if row_index in [0, 1, 3]:  # Green Team rows
+                                # Separate teams perfectly by UI placement indexes
+                                if row_index in [0, 1, 3]:  # Green Team placement profile
                                     green_team.append(player_data)
-                                else:                       # Red Team rows
+                                else:                       # Red Team placement profile
                                     red_team.append(player_data)
                                     
                                 row_index += 1
                             except Exception as parse_err:
-                                logger.error(f"Error parsing row: {parse_err}")
+                                logger.error(f"Error parsing row elements: {parse_err}")
                                 continue
 
-                    # Order both team arrays descending by performance priority metrics
+                    # Performance descending sort layout configuration
                     red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     
                     if red_team or green_team:
+                        # Re-created clean match results embed design setup
                         embed = discord.Embed(
                             title=f"Match Results (from {round_count} rounds)", 
                             color=discord.Color.from_rgb(46, 204, 113)
                         )
                         
-                        # Formatting output structures for Red Team block
+                        # Build Red Team Display Block
                         red_text = ""
                         for idx, p in enumerate(red_team):
                             medal = " 🥈" if idx == 0 and len(red_team) > 0 else ""
@@ -244,7 +245,7 @@ async def on_message(message):
                         if not red_text: red_text = "*No data detected*"
                         embed.add_field(name="🔴 Red Team:", value=red_text, inline=False)
                         
-                        # Formatting output structures for Green Team block
+                        # Build Green Team Display Block
                         green_text = ""
                         for idx, p in enumerate(green_team):
                             medal = " 👑" if idx == 0 else ""
