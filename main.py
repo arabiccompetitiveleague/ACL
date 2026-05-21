@@ -11,10 +11,6 @@ import random
 import string
 import datetime
 import logging
-import re
-import io
-from PIL import Image, ImageOps, ImageEnhance
-import pytesseract
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,9 +26,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 league_lobbies = {}
-
-LEAGUE_CHANNEL_ID = None
-RESULTS_CHANNEL_ID = None
+ALLOWED_CHANNEL_ID = None
 
 rank_labels = {
     "R3": "R3 - Basic",
@@ -45,6 +39,7 @@ rank_labels = {
     "R10": "R10 - Overlord"
 }
 
+# Auto player count based on mode
 MODE_PLAYER_COUNT = {
     "2s": 3,
     "3s": 5,
@@ -95,8 +90,8 @@ class LeagueLobby:
         self.thread = thread
         self.max_players = max_players
         self.required_rank = required_rank
-        self.mode = mode
-        self.gametype = gametype
+        self.mode = mode          # 2s / 3s / 4s
+        self.gametype = gametype  # War / Swift
         self.perks = perks
         self.link = link
         self.joined_users = []
@@ -106,7 +101,7 @@ class LeagueLobby:
         self.code = generate_league_code()
 
     async def auto_close(self, guild):
-        await asyncio.sleep(18000)
+        await asyncio.sleep(18000)  # 5 hours
         if self.owner_id in league_lobbies:
             try:
                 await send_league_log(guild, self, self.host_member)
@@ -127,8 +122,7 @@ async def on_ready():
         logger.info("✅ Slash commands synced")
     except Exception as e:
         logger.error(f"Command sync error: {e}")
-    if not league_cleanup.is_running():
-        league_cleanup.start()
+    league_cleanup.start()
 
 
 @tasks.loop(minutes=30)
@@ -151,307 +145,32 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── IMPROVED SCOREBOARD PARSER ──
+# ── /setchannel ───────────────────────────────────────────────────────────────
 
-def preprocess_img(img):
-    gray = img.convert('L')
-    resized = gray.resize((gray.width * 3, gray.height * 3), Image.Resampling.LANCZOS)
-    enhanced = ImageEnhance.Contrast(resized).enhance(3.0)
-    return enhanced
-
-
-def get_row_team(row_strip):
-    """
-    Samples multiple pixels across the LEFT portion of the row to detect
-    green vs red background via majority voting. Far more reliable than
-    a single pixel sample, especially on dim or glare-affected screens.
-    """
-    rw, rh = row_strip.size
-    green_votes = 0
-    red_votes = 0
-
-    sample_y = rh // 2
-    step = max(1, int(rw * 0.05))
-    for sample_x in range(int(rw * 0.05), int(rw * 0.60), step):
-        if sample_x >= rw:
-            continue
-        pixel = row_strip.getpixel((sample_x, sample_y))
-        r, g, b = pixel[:3]
-
-        # Green row: green channel clearly dominant
-        if g > 80 and g > r + 10 and g > b + 10:
-            green_votes += 1
-        # Red / dark-red row
-        elif r > 60 and r > g + 10:
-            red_votes += 1
-
-    if green_votes == 0 and red_votes == 0:
-        return None  # header or blank row — skip it
-    return "green" if green_votes >= red_votes else "red"
-
-
-def clean_player_name(raw_text):
-    """Strip OCR noise, icons, and UI keywords from extracted name text."""
-    # Remove non-ASCII characters (Korean, Arabic, Japanese, etc.)
-    text = re.sub(r'[^\x00-\x7F]+', '', raw_text)
-    # Remove known header / UI label words
-    text = re.sub(
-        r'(?i)\b(name|device|ping|kd|kills|deaths|victory|defeat|'
-        r'rewards|stats|all|omall|mmall|ammall|oomall|lts|ts)\b',
-        '',
-        text
-    )
-    # Keep only valid username characters
-    text = re.sub(r'[^a-zA-Z0-9_\-]', '', text)
-    return text.strip()
-
-
-def find_best_existing_key(name_lower, master_stats, threshold=3):
-    """
-    Fuzzy deduplication: if a very similar key already exists in master_stats
-    (edit distance <= threshold, or one is a prefix of the other), return that
-    key so kills/deaths are accumulated rather than doubled.
-    """
-    def edit_distance(a, b):
-        if abs(len(a) - len(b)) > threshold:
-            return threshold + 1
-        dp = list(range(len(b) + 1))
-        for i, ca in enumerate(a):
-            new_dp = [i + 1]
-            for j, cb in enumerate(b):
-                new_dp.append(min(dp[j] + (ca != cb), dp[j + 1] + 1, new_dp[-1] + 1))
-            dp = new_dp
-        return dp[-1]
-
-    for existing_key in master_stats:
-        # Prefix match: OCR appended 1-3 junk chars to an existing name
-        if existing_key.startswith(name_lower) or name_lower.startswith(existing_key):
-            return existing_key
-        # Full edit-distance check
-        if edit_distance(existing_key, name_lower) <= threshold:
-            return existing_key
-    return None
-
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user or not message.guild:
+@bot.tree.command(name="setchannel", description="Set current channel for league commands and results")
+async def setchannel(interaction: Interaction):
+    global ALLOWED_CHANNEL_ID
+    if ALLOWED_CHANNEL_ID is not None:
+        old_channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+        name = old_channel.mention if old_channel else f"ID: {ALLOWED_CHANNEL_ID}"
+        await interaction.response.send_message(f"❌ Channel is already set to {name}.", ephemeral=True)
         return
-
-    if RESULTS_CHANNEL_ID and message.channel.id == RESULTS_CHANNEL_ID:
-        if message.attachments:
-            valid_attachments = [
-                a for a in message.attachments
-                if any(a.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp'])
-            ]
-
-            if not valid_attachments:
-                return
-
-            round_count = len(valid_attachments)
-            processing_msg = await message.reply(
-                f"Processing leaderboard stats from {round_count} match screenshot(s)... 🔄"
-            )
-
-            master_stats = {}
-
-            try:
-                for attachment in valid_attachments:
-                    image_bytes = await attachment.read()
-                    orig_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-                    w, h = orig_img.size
-
-                    # Crop to the leaderboard area
-                    crop_left   = int(w * 0.03)
-                    crop_right  = int(w * 0.97)
-                    crop_top    = int(h * 0.22)
-                    crop_bottom = int(h * 0.88)
-
-                    board_img = orig_img.crop((crop_left, crop_top, crop_right, crop_bottom))
-                    bw, bh = board_img.size
-
-                    # Use hOCR to locate row positions from score patterns (e.g. "8/3")
-                    enhanced_board = preprocess_img(board_img)
-                    hocr_data = pytesseract.image_to_data(
-                        enhanced_board, output_type=pytesseract.Output.DICT
-                    )
-
-                    row_centers = []
-                    for idx, text in enumerate(hocr_data['text']):
-                        if '/' in text or (text.isdigit() and int(text) < 100):
-                            y_top    = hocr_data['top'][idx] / 3
-                            y_height = hocr_data['height'][idx] / 3
-                            center_y = y_top + (y_height / 2)
-
-                            if bh * 0.08 < center_y < bh * 0.95:
-                                if not any(abs(center_y - e) < (bh * 0.05) for e in row_centers):
-                                    row_centers.append(center_y)
-
-                    row_centers.sort()
-
-                    # Fallback if hOCR yields too few rows (heavy glare / dark screen)
-                    if len(row_centers) < 2:
-                        row_centers = [
-                            bh * 0.16, bh * 0.30, bh * 0.44,
-                            bh * 0.58, bh * 0.72, bh * 0.86
-                        ]
-
-                    for row_y in row_centers:
-                        box_radius = int(bh * 0.055)
-                        y1 = max(0, int(row_y - box_radius))
-                        y2 = min(bh, int(row_y + box_radius))
-
-                        row_strip = board_img.crop((0, y1, bw, y2))
-                        rw, rh = row_strip.size
-
-                        # ── Team detection via multi-pixel voting ──
-                        detected_team = get_row_team(row_strip)
-                        if detected_team is None:
-                            continue  # header / blank row — skip
-
-                        # ── Score extraction from the right 28% of the row ──
-                        score_box  = row_strip.crop((int(rw * 0.72), 0, rw, rh))
-                        prep_score = preprocess_img(score_box)
-                        score_text = pytesseract.image_to_string(
-                            prep_score, config='--psm 6'
-                        ).strip()
-
-                        score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', score_text)
-                        if not score_match:
-                            continue
-
-                        kills  = int(score_match.group(1))
-                        deaths = int(score_match.group(2))
-
-                        # ── Name extraction from the left 35% only ──
-                        # Keeping it to 35% prevents device/ping icons bleeding in
-                        name_box  = row_strip.crop((0, 0, int(rw * 0.35), rh))
-                        prep_name = preprocess_img(name_box)
-                        name_raw  = pytesseract.image_to_string(
-                            prep_name, config='--psm 7'
-                        ).strip()
-
-                        player_name = clean_player_name(name_raw)
-
-                        if not player_name or len(player_name) < 2:
-                            continue
-
-                        # ── Fuzzy dedup: merge OCR variants of the same player ──
-                        lookup_key = player_name.lower()
-                        existing   = find_best_existing_key(lookup_key, master_stats)
-
-                        if existing:
-                            master_stats[existing]["kills"]  += kills
-                            master_stats[existing]["deaths"] += deaths
-                        else:
-                            master_stats[lookup_key] = {
-                                "display_name": player_name,
-                                "kills":        kills,
-                                "deaths":       deaths,
-                                "team_type":    detected_team,
-                            }
-
-                # ── Build and send the result embed ──
-                if master_stats:
-                    green_team = []
-                    red_team   = []
-
-                    for data in master_stats.values():
-                        k   = data["kills"]
-                        d   = max(1, data["deaths"])
-                        kdr = round(k / d, 2)
-                        payload = {
-                            "name":   data["display_name"],
-                            "kills":  k,
-                            "deaths": data["deaths"],
-                            "kdr":    kdr,
-                        }
-                        if data["team_type"] == "green":
-                            green_team.append(payload)
-                        else:
-                            red_team.append(payload)
-
-                    green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
-                    red_team.sort(  key=lambda x: (x['kills'], x['kdr']), reverse=True)
-
-                    embed_desc = (
-                        f"🏆 **Match Results (Cumulative Stats across {round_count} round(s))**\n\n"
-                    )
-
-                    embed_desc += "🟢 **Green Team:**\n"
-                    if green_team:
-                        for idx, p in enumerate(green_team):
-                            medal = " 👑" if idx == 0 else ""
-                            embed_desc += (
-                                f"• **{p['name']}**: {p['kills']}/{p['deaths']}"
-                                f" ({p['kdr']} KD){medal}\n"
-                            )
-                    else:
-                        embed_desc += "*No players detected*\n"
-
-                    embed_desc += "\n🔴 **Red Team:**\n"
-                    if red_team:
-                        for idx, p in enumerate(red_team):
-                            medal = " 🥈" if idx == 0 else ""
-                            embed_desc += (
-                                f"• **{p['name']}**: {p['kills']}/{p['deaths']}"
-                                f" ({p['kdr']} KD){medal}\n"
-                            )
-                    else:
-                        embed_desc += "*No players detected*\n"
-
-                    embed = discord.Embed(
-                        description=embed_desc,
-                        color=discord.Color.from_rgb(46, 204, 113)
-                    )
-                    await processing_msg.edit(content=None, embed=embed)
-                else:
-                    await processing_msg.edit(
-                        content="❌ Unable to extract stats. Make sure screenshots are clear and unobstructed."
-                    )
-
-            except Exception as e:
-                logger.error(f"OCR execution failure: {e}")
-                await processing_msg.edit(
-                    content="⚠️ An unexpected internal parser error occurred."
-                )
-            return
-
-    await bot.process_commands(message)
+    ALLOWED_CHANNEL_ID = interaction.channel.id
+    await interaction.response.send_message(
+        f"✅ {interaction.channel.mention} is now set for league commands and match results.",
+        ephemeral=True
+    )
 
 
-# ── /setchannel COMMAND ──
-@bot.tree.command(name="setchannel", description="Set target channel for league commands or match results output")
-@app_commands.describe(type="Choose whether this channel is for hosting leagues or displaying match results")
-@app_commands.choices(type=[
-    app_commands.Choice(name="league", value="league"),
-    app_commands.Choice(name="results", value="results")
-])
-async def setchannel(interaction: Interaction, type: app_commands.Choice[str]):
-    global LEAGUE_CHANNEL_ID, RESULTS_CHANNEL_ID
+# ── /league ───────────────────────────────────────────────────────────────────
 
-    if type.value == "league":
-        LEAGUE_CHANNEL_ID = interaction.channel.id
-        await interaction.response.send_message(
-            f"✅ {interaction.channel.mention} is now set as the **League Hosting** channel.",
-            ephemeral=True
-        )
-    elif type.value == "results":
-        RESULTS_CHANNEL_ID = interaction.channel.id
-        await interaction.response.send_message(
-            f"✅ {interaction.channel.mention} is now set as the **Match Results** channel.",
-            ephemeral=True
-        )
-
-
-# ── /league COMMAND ──
 @bot.tree.command(name="league", description="Create a league lobby")
 @app_commands.describe(
     mode="2s, 3s, or 4s (auto-sets player count)",
     gametype="War or Swift",
     perks="Perks on or off",
-    rank="Required Rank (Any or Custom Roles Setup)",
-    link="Game link"
+    rank="Required Rank (Any or R3–R10)",
+    link="Game link (will appear as a clickable link in the thread)"
 )
 @app_commands.choices(
     mode=[
@@ -468,7 +187,8 @@ async def setchannel(interaction: Interaction, type: app_commands.Choice[str]):
         app_commands.Choice(name="Off", value="off"),
     ],
     rank=[app_commands.Choice(name="Any", value="Any")] + [
-        app_commands.Choice(name=label, value=code) for code, label in rank_labels.items()
+        app_commands.Choice(name=f"R{i} - {rank_labels[f'R{i}'].split(' - ')[1]}", value=f"R{i}")
+        for i in range(3, 11)
     ]
 )
 async def league(
@@ -479,26 +199,23 @@ async def league(
     rank: app_commands.Choice[str],
     link: str
 ):
-    if LEAGUE_CHANNEL_ID and interaction.channel.id != LEAGUE_CHANNEL_ID:
-        await interaction.response.send_message(
-            "❌ This command can only be used in the designated League Hosting channel.",
-            ephemeral=True
-        )
+    if ALLOWED_CHANNEL_ID and interaction.channel.id != ALLOWED_CHANNEL_ID:
+        await interaction.response.send_message("❌ Use commands in the set channel only.", ephemeral=True)
         return
 
     creator = interaction.user
     if creator.id in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You already have an active league lobby.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You already have an active league lobby.", ephemeral=True)
         return
 
     required_rank = rank.value
     user_rank, user_rank_label = get_user_rank(creator)
     guild = interaction.guild
 
+    # Auto player count
     max_players = MODE_PLAYER_COUNT[mode.value]
 
+    # ── Embed for the league channel (no league code, has Join button) ──
     channel_embed = discord.Embed(
         title="🏆 ACL LEAGUE",
         description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
@@ -519,24 +236,16 @@ async def league(
         async def join_button(self, join_interaction: Interaction, button: Button):
             user = join_interaction.user
             if lobby.locked:
-                await join_interaction.response.send_message(
-                    "❌ League is locked or cancelled.", ephemeral=True
-                )
+                await join_interaction.response.send_message("❌ League is locked or cancelled.", ephemeral=True)
                 return
             if user.id == lobby.owner_id:
-                await join_interaction.response.send_message(
-                    "❌ You are the host.", ephemeral=True
-                )
+                await join_interaction.response.send_message("❌ You are the host.", ephemeral=True)
                 return
             if user.id in lobby.joined_users:
-                await join_interaction.response.send_message(
-                    "You're already in.", ephemeral=True
-                )
+                await join_interaction.response.send_message("You're already in.", ephemeral=True)
                 return
             if len(lobby.joined_users) >= lobby.max_players:
-                await join_interaction.response.send_message(
-                    "❌ Lobby is full.", ephemeral=True
-                )
+                await join_interaction.response.send_message("❌ Lobby is full.", ephemeral=True)
                 return
 
             u_rank, u_rank_label = get_user_rank(user)
@@ -574,6 +283,7 @@ async def league(
     )
     lobby_message = await interaction.original_response()
 
+    # Private thread
     thread = await interaction.channel.create_thread(
         name=f"⚔️ {creator.name}'s League",
         type=discord.ChannelType.private_thread,
@@ -589,6 +299,7 @@ async def league(
     lobby.view_message = lobby_message
     league_lobbies[creator.id] = lobby
 
+    # ── Embed for the thread (same as channel embed but no Join button) ──
     thread_embed = discord.Embed(
         title="🏆 ACL LEAGUE",
         description=f"**League created by:** {creator.mention} (Rank: {user_rank_label})",
@@ -602,30 +313,33 @@ async def league(
     thread_embed.add_field(name="🔑 League Code", value=f"`{lobby.code}`", inline=False)
     thread_embed.set_footer(text="ACL League")
 
+    # Send game link on top, then embed (no Join button)
     await thread.send(
         content=f"🔗 **Game Link:** [Click here to join the game]({link})",
         embed=thread_embed
     )
 
+    # Private link to host only
     await interaction.followup.send(
         f"✅ Your league thread: {thread.mention}",
         ephemeral=True
     )
 
     asyncio.create_task(lobby.auto_close(guild))
+    logger.info(f"League created by {creator} | Code: {lobby.code}")
 
 
-# ── MANAGEMENT COMMANDS ──
+# ── /closelobby ───────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="closelobby", description="Close your league lobby thread")
 async def closelobby(interaction: Interaction):
     if interaction.user.id not in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You don't have an active league lobby.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You don't have an active league lobby.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
+
     await send_league_log(interaction.guild, lobby, lobby.host_member)
+
     try:
         await lobby.thread.delete()
     except Exception as e:
@@ -634,26 +348,28 @@ async def closelobby(interaction: Interaction):
     await interaction.response.send_message("✅ League lobby closed.", ephemeral=True)
 
 
+# ── /cancelled ────────────────────────────────────────────────────────────────
+
 @bot.tree.command(name="cancelled", description="Cancel the league")
 async def cancelled(interaction: Interaction):
     if interaction.user.id not in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You have no league to cancel.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You have no league to cancel.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
     lobby.locked = True
+
     await send_league_log(interaction.guild, lobby, lobby.host_member)
+
     try:
         await lobby.thread.send("❌ League cancelled by the host.")
         await lobby.thread.delete()
     except Exception as e:
         logger.error(f"Error closing cancelled thread: {e}")
     del league_lobbies[interaction.user.id]
-    await interaction.response.send_message(
-        "League cancelled and thread locked.", ephemeral=True
-    )
+    await interaction.response.send_message("League cancelled and thread locked.", ephemeral=True)
 
+
+# ── /leave ────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="leave", description="Leave the league lobby")
 async def leave(interaction: Interaction):
@@ -663,21 +379,17 @@ async def leave(interaction: Interaction):
             lobby.joined_users.remove(user.id)
             await lobby.thread.remove_user(user)
             await lobby.thread.send(f"{user.mention} has left the league ❌")
-            await interaction.response.send_message(
-                "You have left the league.", ephemeral=True
-            )
+            await interaction.response.send_message("You have left the league.", ephemeral=True)
             return
-    await interaction.response.send_message(
-        "❌ You're not in any league lobby.", ephemeral=True
-    )
+    await interaction.response.send_message("❌ You're not in any league lobby.", ephemeral=True)
 
+
+# ── /status ───────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="status", description="Show who joined the league")
 async def status(interaction: Interaction):
     if interaction.user.id not in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You're not hosting a league.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You're not hosting a league.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
     guild = interaction.guild
@@ -692,6 +404,8 @@ async def status(interaction: Interaction):
         ephemeral=False
     )
 
+
+# ── /team ─────────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="team", description="Generate random teams from joined players")
 @app_commands.describe(team_size="Team size (2v2, 3v3, 4v4)")
@@ -719,9 +433,7 @@ async def team(interaction: Interaction, team_size: app_commands.Choice[int]):
             team_b = shuffled[team_size.value:total_needed]
 
             def mentions(ids):
-                return "\n".join(
-                    interaction.guild.get_member(uid).mention for uid in ids
-                )
+                return "\n".join(interaction.guild.get_member(uid).mention for uid in ids)
 
             msg = (
                 f"**Generated {team_size.name} Teams:**\n\n"
@@ -730,59 +442,49 @@ async def team(interaction: Interaction, team_size: app_commands.Choice[int]):
             )
             await interaction.response.send_message(msg)
             return
-    await interaction.response.send_message(
-        "❌ Use this command inside the league thread.", ephemeral=True
-    )
+    await interaction.response.send_message("❌ Use this command inside the league thread.", ephemeral=True)
 
+
+# ── /addleagueplayer ──────────────────────────────────────────────────────────
 
 @bot.tree.command(name="addleagueplayer", description="Add a player manually to your league")
 @app_commands.describe(user="User to add")
 async def addleagueplayer(interaction: Interaction, user: discord.Member):
     if interaction.user.id not in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You're not hosting a league.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You're not hosting a league.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
     if user.id in lobby.joined_users:
-        return await interaction.response.send_message(
-            "❌ User already in the league.", ephemeral=True
-        )
+        return await interaction.response.send_message("❌ User already in the league.", ephemeral=True)
     if len(lobby.joined_users) >= lobby.max_players:
-        return await interaction.response.send_message(
-            "❌ Lobby is full.", ephemeral=True
-        )
+        return await interaction.response.send_message("❌ Lobby is full.", ephemeral=True)
     u_rank, u_label = get_user_rank(user)
-    if lobby.required_rank != "Any" and (
-        u_rank is None or u_rank < int(lobby.required_rank[1:])
-    ):
-        return await interaction.response.send_message(
-            "❌ User does not meet rank requirement.", ephemeral=True
-        )
+    if lobby.required_rank != "Any" and (u_rank is None or u_rank < int(lobby.required_rank[1:])):
+        return await interaction.response.send_message("❌ User does not meet rank requirement.", ephemeral=True)
     await lobby.thread.add_user(user)
     lobby.joined_users.append(user.id)
     await lobby.thread.send(f"{user.mention} manually added ✅ (Rank: {u_label})")
     return await interaction.response.send_message("✅ User added.", ephemeral=True)
 
 
+# ── /kickleagueplayer ─────────────────────────────────────────────────────────
+
 @bot.tree.command(name="kickleagueplayer", description="Kick a player from your league")
 @app_commands.describe(user="User to kick")
 async def kickleagueplayer(interaction: Interaction, user: discord.Member):
     if interaction.user.id not in league_lobbies:
-        await interaction.response.send_message(
-            "❌ You're not hosting a league.", ephemeral=True
-        )
+        await interaction.response.send_message("❌ You're not hosting a league.", ephemeral=True)
         return
     lobby = league_lobbies[interaction.user.id]
     if user.id not in lobby.joined_users:
-        return await interaction.response.send_message(
-            "❌ User is not in the league.", ephemeral=True
-        )
+        return await interaction.response.send_message("❌ User is not in the league.", ephemeral=True)
     lobby.joined_users.remove(user.id)
     await lobby.thread.remove_user(user)
     await lobby.thread.send(f"{user.mention} was kicked ❌")
     return await interaction.response.send_message("✅ User kicked.", ephemeral=True)
 
+
+# ── /aclhelp ──────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="aclhelp", description="Show all ACL League Bot commands")
 async def help_command(interaction: Interaction):
@@ -792,7 +494,7 @@ async def help_command(interaction: Interaction):
     )
     embed.add_field(
         name="📌 Setup",
-        value="`/setchannel [type: league/results]` — Configure channel modes",
+        value="`/setchannel` — Set channel for league commands and results",
         inline=False
     )
     embed.add_field(
@@ -812,6 +514,8 @@ async def help_command(interaction: Interaction):
     embed.set_footer(text="ACL League Bot")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 
 token = os.getenv("DISCORD_TOKEN")
 if not token:
