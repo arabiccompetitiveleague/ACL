@@ -13,7 +13,7 @@ import datetime
 import logging
 import re
 import io
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 
 logging.basicConfig(
@@ -151,7 +151,26 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── COMPLETELY OVERHAULED DYNAMIC OCR PARSER ──
+# ── FULLY DYNAMIC LINE-BASED SCOREBOARD PARSER ──
+def preprocess_img(img):
+    gray = img.convert('L')
+    resized = gray.resize((gray.width * 3, gray.height * 3), Image.Resampling.LANCZOS)
+    enhanced = ImageEnhance.Contrast(resized).enhance(3.0)
+    return enhanced
+
+def get_team_by_pixel(img, x, y):
+    """Samples background color right where the name sits to securely identify teams."""
+    if x >= img.width or y >= img.height:
+        return "green"
+    r, g, b = img.getpixel((x, y))[:3]
+    # Green background check
+    if g > r + 15 and g > b:
+        return "green"
+    # Red background check
+    elif r > g + 15:
+        return "red"
+    return "green"
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user or not message.guild:
@@ -175,69 +194,98 @@ async def on_message(message):
             try:
                 for attachment in valid_attachments:
                     image_bytes = await attachment.read()
-                    orig_image = Image.open(io.BytesIO(image_bytes))
+                    orig_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+                    w, h = orig_img.size
                     
-                    # Preprocessing layout optimized for text clarity
-                    gray_img = orig_image.convert('L')
-                    gray_img = ImageOps.autocontrast(gray_img)
-                    w, h = gray_img.size
-                    resized_img = gray_img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
+                    # Target crop area around the core center leaderboard container
+                    crop_left = int(w * 0.03)
+                    crop_right = int(w * 0.97)
+                    crop_top = int(h * 0.22)
+                    crop_bottom = int(h * 0.85)
                     
-                    extracted_text = pytesseract.image_to_string(resized_img, config='--psm 6')
-                    lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
+                    board_img = orig_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+                    bw, bh = board_img.size
                     
-                    # Find teams using dynamic balance mapping (green/red background context checks if possible)
-                    # For safety, we balance rows alternatively or read keywords if present.
-                    # Let's cleanly track rows based on appearance sequence.
-                    row_idx = 0
+                    # Run hOCR to find exactly where layout data text coordinates live
+                    enhanced_board = preprocess_img(board_img)
+                    hocr_data = pytesseract.image_to_data(enhanced_board, output_type=pytesseract.Output.DICT)
                     
-                    for line in lines:
-                        # Find kills/deaths safely
-                        score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', line)
-                        if score_match:
-                            try:
-                                kills = int(score_match.group(1))
-                                deaths = int(score_match.group(2))
-                                
-                                # Isolate name component preceding the numerical matrix
-                                raw_name_part = line.split(score_match.group(0))[0].strip()
-                                
-                                # Strip headers leaks and UI artifact elements safely
-                                clean_name = re.sub(
-                                    r'(?i)\b(device|ping|all|omall|mmall|ammall|oomall|aall|leall|lelall|ooisal|kills|deaths|kdr|score|name|victory|defeat|rewards|stats)\b', 
-                                    '', 
-                                    raw_name_part
-                                )
-                                
-                                # Keep explicit characters matching Roblox tags syntax
-                                player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', clean_name).strip()
-                                
-                                # Fallback structure ensuring NO ROW is lost
-                                if not player_name or len(player_name) < 2:
-                                    player_name = f"Player_Slot_{row_idx + 1}"
-                                
-                                # Detect team dynamically. Instead of strict indices, let's look for known groupings or alternative splits.
-                                # Green team is typically on top in victory screens. Let's dynamically group top half as green, bottom half as red.
-                                # Or split dynamically based on total detected lines count.
-                                current_team = "green" if row_idx < 3 else "red"
-                                
-                                lookup_key = player_name.lower()
-                                
-                                if lookup_key in master_stats:
-                                    master_stats[lookup_key]["kills"] += kills
-                                    master_stats[lookup_key]["deaths"] += deaths
-                                else:
-                                    master_stats[lookup_key] = {
-                                        "display_name": player_name,
-                                        "kills": kills,
-                                        "deaths": deaths,
-                                        "team_type": current_team
-                                    }
-                                
-                                row_idx += 1
-                            except Exception:
-                                continue
+                    # Locate vertical layout lines using text positions containing scores or names
+                    row_centers = []
+                    for idx, text in enumerate(hocr_data['text']):
+                        if '/' in text or (text.isdigit() and int(text) < 100):
+                            # Scale coordinates back down to board_img size
+                            y_top = hocr_data['top'][idx] / 3
+                            y_height = hocr_data['height'][idx] / 3
+                            center_y = y_top + (y_height / 2)
+                            
+                            # Filter out headers like "NAME" or "DEVICE" near the absolute top
+                            if center_y > bh * 0.08 and center_y < bh * 0.95:
+                                # Ensure we don't save duplicate coordinate markers for the same row
+                                if not any(abs(center_y - existing) < (bh * 0.05) for existing in row_centers):
+                                    row_centers.append(center_y)
+                                    
+                    row_centers.sort()
+                    
+                    # Fallback pattern if hOCR extraction experiences heavy glare noise
+                    if len(row_centers) < 2:
+                        # Fallback step back to dynamic split estimation if text recognition acts up
+                        row_centers = [bh * 0.16, bh * 0.30, bh * 0.44, bh * 0.58, bh * 0.72, bh * 0.86]
 
+                    # Process each dynamically found row position completely independent of others
+                    for row_y in row_centers:
+                        # Dynamic box height spacing based on board scale
+                        box_radius = int(bh * 0.04)
+                        y1 = max(0, int(row_y - box_radius))
+                        y2 = min(bh, int(row_y + box_radius))
+                        
+                        row_strip = board_img.crop((0, y1, bw, y2))
+                        rw, rh = row_strip.size
+                        
+                        # Extract the score string precisely from the far-right side
+                        score_box = row_strip.crop((int(rw * 0.75), 0, rw, rh))
+                        prep_score = preprocess_img(score_box)
+                        score_text = pytesseract.image_to_string(prep_score, config='--psm 6').strip()
+                        
+                        score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', score_text)
+                        if not score_match:
+                            continue # Ignore non-player rows (like empty text segments or line separations)
+                            
+                        kills = int(score_match.group(1))
+                        deaths = int(score_match.group(2))
+                        
+                        # Extract Name cleanly from the left side (0% to 40% width max)
+                        name_box = row_strip.crop((0, 0, int(rw * 0.40), rh))
+                        prep_name = preprocess_img(name_box)
+                        name_text = pytesseract.image_to_string(prep_name, config='--psm 6').strip()
+                        
+                        # Wash and normalize name strings completely
+                        name_text = re.sub(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', '', name_text)
+                        clean_name = re.sub(
+                            r'(?i)\b(name|device|ping|kd|kills|deaths|victory|defeat|all|omall|mmall|ammall|oomall)\b', 
+                            '', 
+                            name_text
+                        )
+                        player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', clean_name).strip()
+                        
+                        if not player_name or len(player_name) < 2:
+                            continue
+                            
+                        # Detect team perfectly from row color
+                        detected_team = get_team_by_pixel(row_strip, int(rw * 0.20), int(rh * 0.5))
+                        
+                        lookup_key = player_name.lower()
+                        if lookup_key in master_stats:
+                            master_stats[lookup_key]["kills"] += kills
+                            master_stats[lookup_key]["deaths"] += deaths
+                        else:
+                            master_stats[lookup_key] = {
+                                "display_name": player_name,
+                                "kills": kills,
+                                "deaths": deaths,
+                                "team_type": detected_team
+                            }
+                            
                 if master_stats:
                     green_team = []
                     red_team = []
@@ -259,10 +307,10 @@ async def on_message(message):
                         else:
                             red_team.append(player_payload)
 
-                    red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
+                    red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     
-                    embed_desc = f"**🏆 Match Results (Cumulative Stats across {round_count} round(s))**\n\n"
+                    embed_desc = f"🏆 **Match Results (Cumulative Stats across {round_count} round(s))**\n\n"
                     
                     embed_desc += "🟢 **Green Team:**\n"
                     if green_team:
@@ -280,8 +328,6 @@ async def on_message(message):
                     else:
                         embed_desc += "*No players detected*\n"
 
-                    embed_desc += "\n*If players swapped teams or substituted, their names will still show up aggregated perfectly above.*"
-
                     embed = discord.Embed(
                         description=embed_desc,
                         color=discord.Color.from_rgb(46, 204, 113)
@@ -289,10 +335,10 @@ async def on_message(message):
                     
                     await processing_msg.edit(content=None, embed=embed)
                 else:
-                    await processing_msg.edit(content="❌ Unable to extract readable score layouts. Check your source clip cropped area.")
+                    await processing_msg.edit(content="❌ Unable to extract layout values. Ensure your score images are fully clear.")
             except Exception as e:
                 logger.error(f"OCR execution failure: {e}")
-                await processing_msg.edit(content="⚠️ An unexpected internal parser exception occurred.")
+                await processing_msg.edit(content="⚠️ An unexpected internal parser error occurred.")
             return
 
     await bot.process_commands(message)
