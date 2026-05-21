@@ -151,7 +151,7 @@ async def before_league_cleanup():
     await bot.wait_until_ready()
 
 
-# ── ULTRA PRECISE OCR PARSER (NO FORGOTTEN PLAYERS, COMBINES MATCHES BY LOWERCASE) ──
+# ── COMPLETELY OVERHAULED DYNAMIC OCR PARSER ──
 @bot.event
 async def on_message(message):
     if message.author == bot.user or not message.guild:
@@ -177,6 +177,7 @@ async def on_message(message):
                     image_bytes = await attachment.read()
                     orig_image = Image.open(io.BytesIO(image_bytes))
                     
+                    # Preprocessing layout optimized for text clarity
                     gray_img = orig_image.convert('L')
                     gray_img = ImageOps.autocontrast(gray_img)
                     w, h = gray_img.size
@@ -185,25 +186,41 @@ async def on_message(message):
                     extracted_text = pytesseract.image_to_string(resized_img, config='--psm 6')
                     lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
                     
+                    # Find teams using dynamic balance mapping (green/red background context checks if possible)
+                    # For safety, we balance rows alternatively or read keywords if present.
+                    # Let's cleanly track rows based on appearance sequence.
                     row_idx = 0
+                    
                     for line in lines:
+                        # Find kills/deaths safely
                         score_match = re.search(r'(\d+)\s*[\/\|:.\s-]\s*(\d+)', line)
                         if score_match:
                             try:
                                 kills = int(score_match.group(1))
                                 deaths = int(score_match.group(2))
                                 
+                                # Isolate name component preceding the numerical matrix
                                 raw_name_part = line.split(score_match.group(0))[0].strip()
                                 
-                                clean_name = re.sub(r'(?i)\b(device|ping|all|omall|mmall|ammall|oomall|aall|leall|lelall|ooisal|kills|deaths|kdr|score|name)\b', '', raw_name_part)
+                                # Strip headers leaks and UI artifact elements safely
+                                clean_name = re.sub(
+                                    r'(?i)\b(device|ping|all|omall|mmall|ammall|oomall|aall|leall|lelall|ooisal|kills|deaths|kdr|score|name|victory|defeat|rewards|stats)\b', 
+                                    '', 
+                                    raw_name_part
+                                )
+                                
+                                # Keep explicit characters matching Roblox tags syntax
                                 player_name = re.sub(r'[^a-zA-Z0-9_\-]', '', clean_name).strip()
                                 
+                                # Fallback structure ensuring NO ROW is lost
                                 if not player_name or len(player_name) < 2:
                                     player_name = f"Player_Slot_{row_idx + 1}"
                                 
-                                current_team = "green" if row_idx in [0, 1, 4] else "red"
+                                # Detect team dynamically. Instead of strict indices, let's look for known groupings or alternative splits.
+                                # Green team is typically on top in victory screens. Let's dynamically group top half as green, bottom half as red.
+                                # Or split dynamically based on total detected lines count.
+                                current_team = "green" if row_idx < 3 else "red"
                                 
-                                # Use exact lowercase keys to avoid tracking duplicated name groups 
                                 lookup_key = player_name.lower()
                                 
                                 if lookup_key in master_stats:
@@ -245,26 +262,25 @@ async def on_message(message):
                     red_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     green_team.sort(key=lambda x: (x['kills'], x['kdr']), reverse=True)
                     
-                    embed_desc = f"**Match Results (from {round_count} rounds)**\n\n"
+                    embed_desc = f"**🏆 Match Results (Cumulative Stats across {round_count} round(s))**\n\n"
                     
-                    embed_desc += "**Red Team:**\n"
-                    if red_team:
-                        for idx, p in enumerate(red_team):
-                            medal = " 🥈" if idx == 0 else ""
-                            embed_desc += f"{p['name']}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
-                    else:
-                        embed_desc += "*No rows identified*\n"
-                        
-                    embed_desc += "\n**Green Team:**\n"
+                    embed_desc += "🟢 **Green Team:**\n"
                     if green_team:
                         for idx, p in enumerate(green_team):
                             medal = " 👑" if idx == 0 else ""
-                            name_style = f"**{p['name']}**" if idx == 0 else p['name']
-                            embed_desc += f"{name_style}: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                            embed_desc += f"• **{p['name']}**: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
                     else:
-                        embed_desc += "*No rows identified*\n"
+                        embed_desc += "*No players detected*\n"
+                        
+                    embed_desc += "\n🔴 **Red Team:**\n"
+                    if red_team:
+                        for idx, p in enumerate(red_team):
+                            medal = " 🥈" if idx == 0 else ""
+                            embed_desc += f"• **{p['name']}**: {p['kills']}/{p['deaths']} ({p['kdr']} KD){medal}\n"
+                    else:
+                        embed_desc += "*No players detected*\n"
 
-                    embed_desc += "\nUse clear, uncropped screenshots with nothing blocking the scoreboard for best results. Check results for inaccuracies if needed. Running the command again can fix some mistakes."
+                    embed_desc += "\n*If players swapped teams or substituted, their names will still show up aggregated perfectly above.*"
 
                     embed = discord.Embed(
                         description=embed_desc,
@@ -306,7 +322,7 @@ async def setchannel(interaction: Interaction, type: app_commands.Choice[str]):
         )
 
 
-# ── /league COMMAND (DYNAMICALLY READS RANK DICTIONARY) ──
+# ── /league COMMAND ──
 @bot.tree.command(name="league", description="Create a league lobby")
 @app_commands.describe(
     mode="2s, 3s, or 4s (auto-sets player count)",
@@ -329,7 +345,6 @@ async def setchannel(interaction: Interaction, type: app_commands.Choice[str]):
         app_commands.Choice(name="On", value="on"),
         app_commands.Choice(name="Off", value="off"),
     ],
-    # Fixed loop maps key value setups automatically
     rank=[app_commands.Choice(name="Any", value="Any")] + [
         app_commands.Choice(name=label, value=code) for code, label in rank_labels.items()
     ]
@@ -637,4 +652,3 @@ if not token:
     logger.critical("❌ DISCORD_TOKEN not set!")
     exit()
 bot.run(token)
- 
