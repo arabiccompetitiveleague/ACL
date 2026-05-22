@@ -818,4 +818,3 @@ if not token:
     logger.critical("❌ DISCORD_TOKEN not set!")
     exit()
 bot.run(token)
- 
